@@ -118,12 +118,13 @@ if dg_file:
     "Player Name",
     "PLAYER"])
     # common column names for SG splits in performance tables
-    col_app = find_col(dg, ["APP", "SG_APP", "Approach", "SG:APP"])
-    col_ott = find_col(dg, ["OTT", "SG_OTT", "Off the Tee", "SG:OTT"])
-    col_arg = find_col(dg, ["ARG", "SG_ARG", "Around Green", "SG:ARG"])
-    col_putt = find_col(dg, ["PUTT", "SG_PUTT", "Putting", "SG:PUTT"])
-    col_t2g = find_col(dg, ["T2G", "SG_T2G", "Tee to Green", "SG:T2G"])
-    col_total = find_col(dg, ["TOTAL", "SG_TOTAL", "Total", "SG:TOTAL"])
+    col_app = find_col(dg, ["APP", "app", "SG_APP", "Approach", "sg_app"])
+    col_ott = find_col(dg, ["OTT", "ott", "SG_OTT", "Off the Tee", "sg_ott"])
+    col_arg = find_col(dg, ["ARG", "arg", "SG_ARG", "Around Green", "sg_arg"])
+    col_putt = find_col(dg, ["PUTT", "putt", "SG_PUTT", "Putting", "sg_putt"])
+    col_t2g = find_col(dg, ["T2G", "t2g", "SG_T2G", "Tee to Green", "sg_t2g"])
+    col_total = find_col(dg, ["TOTAL", "total", "SG_TOTAL", "Total", "sg_total"])
+
 
     if not dg_name:
         st.warning("DataGolf file is missing a recognizable Name column. We'll run DK-only for now.")
