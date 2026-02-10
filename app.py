@@ -148,7 +148,14 @@ st.subheader("Build Lineup")
 if st.button("Generate Lineup"):
     from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpBinary, PULP_CBC_CMD
 
-    pool = dk.reset_index(drop=True)
+    pool = dk.copy()
+
+# Remove players with missing projections
+pool = pool.replace([np.inf, -np.inf], np.nan)
+pool = pool.dropna(subset=["se_proj", salary_col])
+
+pool = pool.reset_index(drop=True)
+
 
     prob = LpProblem("DK_Golf", LpMaximize)
     x = [LpVariable(f"x{i}", 0, 1, LpBinary) for i in range(len(pool))]
