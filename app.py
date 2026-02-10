@@ -112,7 +112,11 @@ cut_safety_available = False
 if dg_file:
     dg = pd.read_csv(dg_file)
 
-    dg_name = find_col(dg, ["Name", "Player", "Golfer"])
+    dg_name = find_col(dg, ["Name",
+    "Player",
+    "player_name",
+    "Player Name",
+    "PLAYER"])
     # common column names for SG splits in performance tables
     col_app = find_col(dg, ["APP", "SG_APP", "Approach", "SG:APP"])
     col_ott = find_col(dg, ["OTT", "SG_OTT", "Off the Tee", "SG:OTT"])
