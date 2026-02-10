@@ -21,15 +21,30 @@ def norm_name(s: str) -> str:
     return s
 
 def find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    # exact matches
     for c in candidates:
         if c in df.columns:
             return c
-    # Try case-insensitive match
+
+    # case-insensitive matches
     cols_l = {c.lower(): c for c in df.columns}
     for c in candidates:
         if c.lower() in cols_l:
             return cols_l[c.lower()]
+
+    # flexible matching (handles player_name, player-name, etc.)
+    def normalize(s):
+        return s.lower().replace("_", "").replace(" ", "").replace("-", "")
+
+    normalized_cols = {normalize(c): c for c in df.columns}
+
+    for c in candidates:
+        key = normalize(c)
+        if key in normalized_cols:
+            return normalized_cols[key]
+
     return None
+
 
 def zscore(series: pd.Series) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
