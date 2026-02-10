@@ -143,6 +143,54 @@ if dg_file:
             how="left"
         )
 
+    # ---------------------------
+# CutSafety (DataGolf SG-based)
+# ---------------------------
+
+def zscore(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    mu = s.mean()
+    sd = s.std(ddof=0)
+    if sd == 0 or np.isnan(sd):
+        return pd.Series(np.zeros(len(s)), index=s.index)
+    return (s - mu) / sd
+
+# Identify SG columns (supports DataGolf exports like app_true, ott_true, etc.)
+def pick_col(df: pd.DataFrame, options: list[str]) -> str | None:
+    cols = {c.lower(): c for c in df.columns}
+    for opt in options:
+        if opt.lower() in cols:
+            return cols[opt.lower()]
+    return None
+
+col_app   = pick_col(merged, ["app_true", "sg_app", "app"])
+col_ott   = pick_col(merged, ["ott_true", "sg_ott", "ott"])
+col_arg   = pick_col(merged, ["arg_true", "sg_arg", "arg"])
+col_putt  = pick_col(merged, ["putt_true", "sg_putt", "putt"])
+col_t2g   = pick_col(merged, ["t2g_true", "sg_t2g", "t2g"])
+col_total = pick_col(merged, ["total_true", "sg_total", "total"])
+
+# Only compute if we have enough data
+needed = [col_app, col_ott, col_t2g, col_total]
+if all(c is not None for c in needed):
+    z_app   = zscore(merged[col_app])
+    z_ott   = zscore(merged[col_ott])
+    z_arg   = zscore(merged[col_arg]) if col_arg else pd.Series(0, index=merged.index)
+    z_putt  = zscore(merged[col_putt]) if col_putt else pd.Series(0, index=merged.index)
+    z_t2g   = zscore(merged[col_t2g])
+    z_total = zscore(merged[col_total])
+
+    # Ball striking proxy (stable for making cuts)
+    ball_strike = 0.55 * z_app + 0.35 * z_ott + 0.10 * z_arg
+
+    # CutSafety emphasizes tee-to-green + total form
+    cut_safety_z = 0.70 * z_t2g + 0.30 * z_total
+
+    # Penalize "putting-only" spikes (less reliable for cut safety)
+    putting_only_penalty = np.where((z_putt > 0.8) & (ball_strike < -0.4), 0.25, 0.0)
+    merged["CutSafetyZ"] = cut_saf_
+
+
         # Build CutSafety score from SG stats (z-scored for stability)
         # Fallback hierarchy: T2G+TOTAL if available else BallStrike proxy
         if col_t2g or col_app:
