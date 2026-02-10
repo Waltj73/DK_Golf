@@ -1,8 +1,6 @@
-# DK Golf — PGA Optimizer (SE Cash Balanced)
-# Run with:
-#   streamlit run app.py
-# Requires:
-#   pip install streamlit pandas numpy pulp
+# DK Golf — PGA Optimizer (Single Entry • Cash Consistency • Balanced)
+# Run: streamlit run app.py
+# Requires: pip install streamlit pandas numpy pulp
 
 import re
 import numpy as np
@@ -12,15 +10,12 @@ import streamlit as st
 SALARY_CAP = 50000
 ROSTER_SIZE = 6
 
-# ---------- Name Normalization ----------
+# ---------- Name handling ----------
 def norm_name(s):
     s = str(s).strip().lower()
-
-    # handle "Last, First"
     if "," in s:
         last, first = s.split(",", 1)
         s = first.strip() + " " + last.strip()
-
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"[^a-z\s\-']", "", s)
     return s
@@ -37,8 +32,7 @@ def zscore(series):
 
 def normalize_cols(df):
     df.columns = (
-        df.columns
-        .str.lower()
+        df.columns.str.lower()
         .str.replace(" ", "_")
         .str.replace("-", "_")
     )
@@ -53,7 +47,7 @@ def find_col(df, names):
     return None
 
 
-# ---------- Streamlit ----------
+# ---------- UI ----------
 st.set_page_config(layout="wide")
 st.title("DK Golf — PGA Optimizer (Single Entry • Balanced Cash)")
 
@@ -75,7 +69,7 @@ avg_col = find_col(dk, ["avgpointspergame"])
 dk["name_key"] = dk[name_col].map(norm_name)
 dk[salary_col] = pd.to_numeric(dk[salary_col], errors="coerce")
 
-# ---------- Base Projection ----------
+# ---------- Projection baseline ----------
 median_salary = dk[salary_col].median()
 slope = 3.0 / 1000
 a = 55 - slope * median_salary
@@ -87,7 +81,7 @@ if avg_col:
 else:
     dk["base_proj"] = dk["salary_proj"]
 
-# ---------- Load DataGolf ----------
+# ---------- DataGolf merge ----------
 cut_available = False
 
 if dg_file:
@@ -108,7 +102,6 @@ if dg_file:
     keep = [c for c in keep if c]
 
     dg_small = dg[keep].copy()
-
     dk = dk.merge(dg_small, on="name_key", how="left")
 
     if all(c in dk.columns for c in [col_app, col_ott, col_t2g, col_total]):
@@ -134,7 +127,7 @@ if dg_file:
 if not cut_available:
     dk["cut_safety"] = 0
 
-# ---------- SE Projection ----------
+# ---------- Final SE projection ----------
 dk["proj_z"] = zscore(dk["base_proj"])
 dk["cut_z2"] = zscore(dk["cut_safety"])
 
