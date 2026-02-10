@@ -150,11 +150,11 @@ if st.button("Generate Lineup"):
 
     pool = dk.copy()
 
-# Remove players with missing projections
-pool = pool.replace([np.inf, -np.inf], np.nan)
-pool = pool.dropna(subset=["se_proj", salary_col])
+    # Remove players with missing projections
+    pool = pool.replace([np.inf, -np.inf], np.nan)
+    pool = pool.dropna(subset=["se_proj", salary_col])
 
-pool = pool.reset_index(drop=True)
+    pool = pool.reset_index(drop=True)
 
 
     prob = LpProblem("DK_Golf", LpMaximize)
