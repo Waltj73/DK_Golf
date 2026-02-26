@@ -1,374 +1,662 @@
-# app.py
-# DK Golf — PGA Optimizer (Single Entry • Balanced Cash • Pro Mode)
-# What this version adds (your request "C"):
-#   ✅ Balanced constraints (min salary, max punts, cap expensive studs, min avg salary)
-#   ✅ Multi-lineup generator (1–3 lineups)
-#   ✅ Randomness control (for uniqueness / SE GPP pivots)
-#   ✅ Max overlap control across generated lineups
-#   ✅ DK + DataGolf robust merge + CutSafety
-#   ✅ NaN/inf-safe optimizer (won’t crash if some players don’t merge)
+# app.py — DK Golf: PGA Optimizer (Single Entry • Balanced Cash • Pro Mode)
+# ------------------------------------------------------------
+# Upload DK Salaries CSV + (optional) DataGolf performance CSV
+# Builds 1–3 lineups with constraints and optional "Spike lineup":
+#   Lineup #2: 2 studs (>= threshold) + 1 punt (< 7k)
 #
-# Run:
-#   streamlit run app.py
+# Fixes:
+# - Auto-detect player name columns (no manual renaming)
+# - Cleans NaN/inf to prevent PuLP objective crashes
+# - Avoids KeyError/indentation issues
 #
-# Install:
-#   pip install streamlit pandas numpy pulp
+# Requirements (put in requirements.txt):
+# streamlit
+# pandas
+# numpy
+# pulp
+# ------------------------------------------------------------
 
+from __future__ import annotations
+
+import io
 import re
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpBinary, PULP_CBC_CMD
 
-SALARY_CAP = 50000
-ROSTER_SIZE = 6
-
-# -------------------------
-# Helpers
-# -------------------------
-def norm_name(s: str) -> str:
-    s = str(s).strip().lower()
-    # handle "Last, First"
-    if "," in s:
-        last, first = s.split(",", 1)
-        s = first.strip() + " " + last.strip()
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"[^a-z\s\-']", "", s)
-    return s
-
-def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = (
-        df.columns.astype(str)
-        .str.lower()
-        .str.strip()
-        .str.replace(" ", "_")
-        .str.replace("-", "_")
-        .str.replace("+", "_")
+try:
+    from pulp import (
+        LpProblem,
+        LpMaximize,
+        LpVariable,
+        lpSum,
+        LpStatus,
+        PULP_CBC_CMD,
+        value,
     )
-    return df
+except Exception:
+    st.error("PuLP is not installed. Add `pulp` to your requirements.txt and redeploy.")
+    st.stop()
 
-def find_col(df: pd.DataFrame, options: list[str]) -> str | None:
-    cols = {c.lower(): c for c in df.columns}
-    for opt in options:
-        if opt.lower() in cols:
-            return cols[opt.lower()]
-    return None
 
-def zscore(series: pd.Series) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    mu = s.mean()
-    sd = s.std(ddof=0)
-    if sd == 0 or np.isnan(sd):
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return (s - mu) / sd
+# =========================
+# STREAMLIT CONFIG
+# =========================
+st.set_page_config(page_title="DK Golf — PGA Optimizer", layout="wide")
 
-def safe_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    for c in cols:
-        if c and c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-# -------------------------
-# UI
-# -------------------------
-st.set_page_config(page_title="DK Golf — SE Balanced Pro", layout="wide")
 st.title("DK Golf — PGA Optimizer (Single Entry • Balanced Cash • Pro Mode)")
 
-with st.expander("What to upload / workflow", expanded=False):
-    st.markdown(
-        "- Upload **DraftKings Salaries CSV** (standard export)\n"
-        "- Upload **DataGolf Performance CSV** (the performance table export)\n"
-        "- Tune **Balanced Constraints** + **Randomness**\n"
-        "- Click **Generate Lineups** (1–3)\n"
+
+# =========================
+# HELPERS
+# =========================
+def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def detect_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """
+    Return the first matching column name from candidates (case-insensitive),
+    or None if none found.
+    """
+    cols = list(df.columns)
+    lower_map = {c.lower(): c for c in cols}
+    # direct match
+    for cand in candidates:
+        if cand in cols:
+            return cand
+    # case-insensitive match
+    for cand in candidates:
+        key = cand.lower()
+        if key in lower_map:
+            return lower_map[key]
+    # fuzzy contains match
+    for c in cols:
+        cl = c.lower()
+        for cand in candidates:
+            if cand.lower() in cl:
+                return c
+    return None
+
+
+_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
+
+def norm_name(x: str) -> str:
+    """
+    Normalize player name for joining across sources.
+    """
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return ""
+    s = str(x).strip().lower()
+
+    # Remove accents-ish (best-effort without extra deps)
+    s = (
+        s.replace("’", "'")
+        .replace("`", "'")
+        .replace("–", "-")
+        .replace("—", "-")
     )
 
+    # Remove punctuation except space
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    parts = s.split()
+    # drop suffix if last token is suffix
+    if parts and parts[-1] in _SUFFIXES:
+        parts = parts[:-1]
+
+    return " ".join(parts)
+
+
+def to_num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
+
+def safe_numeric(df: pd.DataFrame, cols: List[str], fill: float = 0.0) -> pd.DataFrame:
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            df[c] = to_num(df[c])
+            df[c] = df[c].replace([np.inf, -np.inf], np.nan).fillna(fill)
+    return df
+
+
+def percentile_rank(series: pd.Series) -> pd.Series:
+    s = series.copy()
+    s = s.replace([np.inf, -np.inf], np.nan)
+    if s.notna().sum() <= 1:
+        return pd.Series([50.0] * len(s), index=s.index)
+    # 0..1 then 0..100
+    return s.rank(pct=True).fillna(0.5) * 100.0
+
+
+@dataclass
+class BuildResult:
+    lineup: pd.DataFrame
+    total_salary: int
+    total_proj: float
+    status: str
+
+
+# =========================
+# SIDEBAR: WORKFLOW
+# =========================
+with st.expander("What to upload / workflow", expanded=False):
+    st.markdown(
+        """
+**You need:**
+1) **DraftKings Salaries CSV** (the DK export for the tournament slate)
+2) *(Optional but recommended)* **DataGolf Performance CSV** (your performance table export)
+
+**Flow:**
+- Upload files
+- Tune (or leave defaults)
+- Generate 1–3 lineups
+- Download CSV
+
+**Pro tip**
+- Use **2 lineups**:
+  - Lineup 1 = balanced/safe
+  - Lineup 2 = spike (2 studs + 1 punt)
+"""
+    )
+
+
+# =========================
+# UPLOADS
+# =========================
 st.subheader("Upload Files")
-dk_file = st.file_uploader("DraftKings Salaries CSV", type=["csv"])
-dg_file = st.file_uploader("DataGolf Performance CSV", type=["csv"])
+
+colA, colB = st.columns(2)
+
+with colA:
+    dk_file = st.file_uploader("DraftKings Salaries CSV", type=["csv"])
+with colB:
+    dg_file = st.file_uploader("DataGolf Performance CSV (optional)", type=["csv"])
 
 if not dk_file:
+    st.info("Upload a DraftKings Salaries CSV to begin.")
     st.stop()
 
-# -------------------------
-# Load DK
-# -------------------------
+# Read DK
 dk = pd.read_csv(dk_file)
-dk = normalize_cols(dk)
+dk = _clean_cols(dk)
 
-name_col = find_col(dk, ["name", "player", "name_id"])
-salary_col = find_col(dk, ["salary"])
-avg_col = find_col(dk, ["avgpointspergame", "avg_points_per_game", "avg_points"])
+# Detect DK columns
+dk_name_col = detect_col(dk, ["Name", "Player", "Player Name", "Golfer", "player_name"])
+dk_salary_col = detect_col(dk, ["Salary", "salary"])
+dk_avg_col = detect_col(
+    dk,
+    [
+        "AvgPointsPerGame",
+        "DK AvgPointsPerGame",
+        "DKAvgPointsPerGame",
+        "AvgPoints",
+        "Avg DK Points",
+        "Avg DK",
+    ],
+)
 
-if name_col is None or salary_col is None:
-    st.error("Could not detect DK columns. Your DK file must include at least Name and Salary.")
+# Validate required columns
+missing = []
+if not dk_name_col:
+    missing.append("Name")
+if not dk_salary_col:
+    missing.append("Salary")
+
+if missing:
+    st.error(
+        "Your DK CSV is missing required columns (or they weren't recognized).\n\n"
+        f"Missing: {', '.join(missing)}\n\n"
+        f"Found columns: {list(dk.columns)}"
+    )
     st.stop()
 
-dk[name_col] = dk[name_col].astype(str)
-dk[salary_col] = pd.to_numeric(dk[salary_col], errors="coerce")
-if avg_col:
-    dk[avg_col] = pd.to_numeric(dk[avg_col], errors="coerce")
+dk = dk.rename(columns={dk_name_col: "name", dk_salary_col: "salary"})
+dk["name_key"] = dk["name"].map(norm_name)
+dk["salary"] = to_num(dk["salary"]).fillna(0).astype(int)
 
-dk = dk.dropna(subset=[name_col, salary_col]).copy()
-dk = dk[dk[salary_col] > 0].reset_index(drop=True)
-
-dk["name_key"] = dk[name_col].map(norm_name)
-
-# -------------------------
-# Base projection (DK + salary curve)
-# -------------------------
-st.subheader("Projection Baseline (leave defaults unless you want to tune)")
-median_salary = float(dk[salary_col].median())
-
-target_median_points = st.slider("Salary anchor points (median salary golfer)", 20.0, 90.0, 55.0, 0.5)
-slope_per_1k = st.slider("Salary slope (points per $1k)", 1.0, 6.0, 3.0, 0.1)
-
-b = slope_per_1k / 1000.0
-a = target_median_points - b * median_salary
-dk["salary_proj"] = (a + b * dk[salary_col]).clip(lower=0)
-
-if avg_col:
-    w_avg = st.slider("Weight on DK AvgPointsPerGame", 0.0, 1.0, 0.70, 0.05)
-    dk["base_proj"] = w_avg * dk[avg_col].fillna(dk["salary_proj"]) + (1 - w_avg) * dk["salary_proj"]
+# If DK avg points exists, keep it; else create empty
+if dk_avg_col:
+    dk = dk.rename(columns={dk_avg_col: "dk_avg"})
+    dk["dk_avg"] = to_num(dk["dk_avg"]).replace([np.inf, -np.inf], np.nan)
 else:
-    dk["base_proj"] = dk["salary_proj"]
+    dk["dk_avg"] = np.nan
 
-# -------------------------
-# Load DataGolf + merge + CutSafety
-# -------------------------
-cut_available = False
-dk["cut_safety"] = 0.0
+# Drop invalid names
+dk = dk[dk["name_key"].astype(bool)].copy()
+dk = dk.drop_duplicates(subset=["name_key"], keep="first").reset_index(drop=True)
 
+# =========================
+# OPTIONAL: READ DATAGOLF
+# =========================
+dg = None
+dg_merged = False
 if dg_file:
     dg = pd.read_csv(dg_file)
-    dg = normalize_cols(dg)
+    dg = _clean_cols(dg)
 
-    dg_name = find_col(dg, ["player_name", "name", "player"])
-    if dg_name is None:
-        st.warning("Could not detect player name column in DataGolf file. Running DK-only.")
+    dg_name_col = detect_col(dg, ["Player", "Name", "player_name", "Golfer"])
+    if not dg_name_col:
+        st.warning(
+            "DataGolf CSV uploaded, but no recognizable player name column was found. "
+            "We’ll run DK-only this week."
+        )
+        dg = None
     else:
-        dg[dg_name] = dg[dg_name].astype(str)
-        dg["name_key"] = dg[dg_name].map(norm_name)
+        dg = dg.rename(columns={dg_name_col: "player_name"})
+        dg["name_key"] = dg["player_name"].map(norm_name)
+        dg = dg[dg["name_key"].astype(bool)].copy()
 
-        # support DataGolf columns like *_true
-        col_app = find_col(dg, ["app_true", "sg_app", "app"])
-        col_ott = find_col(dg, ["ott_true", "sg_ott", "ott"])
-        col_arg = find_col(dg, ["arg_true", "sg_arg", "arg"])
-        col_putt = find_col(dg, ["putt_true", "sg_putt", "putt"])
-        col_t2g = find_col(dg, ["t2g_true", "sg_t2g", "t2g"])
-        col_total = find_col(dg, ["total_true", "sg_total", "total"])
+        # Try to find useful DataGolf performance columns (best-effort)
+        # Common possibilities across exports
+        dg_total_sg_col = detect_col(
+            dg,
+            ["TOTAL", "SG: TOTAL", "Strokes Gained: Total", "True SG", "TRUE SG", "true_sg", "sg_total"],
+        )
+        dg_t2g_col = detect_col(dg, ["T2G", "SG: T2G", "sg_t2g", "tee_to_green"])
+        dg_app_col = detect_col(dg, ["APP", "Approach", "SG: APP", "sg_app", "sg_approach"])
+        dg_putt_col = detect_col(dg, ["PUTT", "Putting", "SG: PUTT", "sg_putt"])
+        dg_ott_col = detect_col(dg, ["OTT", "Off-the-tee", "Off the Tee", "SG: OTT", "sg_ott"])
+        dg_arg_col = detect_col(dg, ["ARG", "Around the Green", "SG: ARG", "sg_arg"])
 
-        keep = ["name_key"] + [c for c in [col_app, col_ott, col_arg, col_putt, col_t2g, col_total] if c]
-        dg_small = dg[keep].copy()
-        dg_small = safe_numeric(dg_small, [col_app, col_ott, col_arg, col_putt, col_t2g, col_total])
+        # Keep a compact DG table for merge
+        keep = ["name_key"]
+        rename_map = {}
+        for col, new in [
+            (dg_total_sg_col, "dg_sg_total"),
+            (dg_t2g_col, "dg_sg_t2g"),
+            (dg_app_col, "dg_sg_app"),
+            (dg_putt_col, "dg_sg_putt"),
+            (dg_ott_col, "dg_sg_ott"),
+            (dg_arg_col, "dg_sg_arg"),
+        ]:
+            if col:
+                keep.append(col)
+                rename_map[col] = new
 
-        dk = dk.merge(dg_small, on="name_key", how="left")
+        dg_small = dg[keep].rename(columns=rename_map).copy()
 
-        # compute cut safety if we have core columns
-        if all(c is not None and c in dk.columns for c in [col_app, col_ott, col_t2g, col_total]):
-            z_app = zscore(dk[col_app])
-            z_ott = zscore(dk[col_ott])
-            z_t2g = zscore(dk[col_t2g])
-            z_total = zscore(dk[col_total])
+        # numeric clean
+        dg_small = safe_numeric(
+            dg_small,
+            [c for c in dg_small.columns if c.startswith("dg_")],
+            fill=np.nan,
+        )
 
-            z_arg = zscore(dk[col_arg]) if col_arg and col_arg in dk.columns else pd.Series(0, index=dk.index)
-            z_putt = zscore(dk[col_putt]) if col_putt and col_putt in dk.columns else pd.Series(0, index=dk.index)
-
-            ball_strike = 0.55 * z_app + 0.35 * z_ott + 0.10 * z_arg
-            cut_z = 0.70 * z_t2g + 0.30 * z_total
-
-            # penalize "putting-only" profiles for cash stability
-            penalty = np.where((z_putt > 0.8) & (ball_strike < -0.4), 0.25, 0.0)
-            dk["cut_safety_z"] = cut_z - penalty
-
-            cs = dk["cut_safety_z"]
-            dk["cut_safety"] = 100 * (cs - cs.min()) / (cs.max() - cs.min() + 1e-9)
-            dk["cut_safety"] = dk["cut_safety"].clip(0, 100)
-
-            cut_available = True
-        else:
-            st.warning("DataGolf loaded but missing key SG columns (APP/OTT/T2G/TOTAL). Running DK-only.")
-
-# -------------------------
-# SE projection blend
-# -------------------------
-st.subheader("Single Entry Blend")
-if cut_available:
-    cut_weight = st.slider("CutSafety weight (SE cash bias)", 0.0, 0.60, 0.25, 0.05)
+        # Merge
+        merged = dk.merge(dg_small, on="name_key", how="left")
+        dg_merged = True
 else:
-    cut_weight = 0.0
-    st.info("CutSafety unavailable (DG not merged or missing stats). SE will run DK-only.")
+    merged = dk.copy()
 
-dk["proj_z"] = zscore(dk["base_proj"])
-dk["cut_z2"] = zscore(dk["cut_safety"]) if cut_available else pd.Series(0, index=dk.index)
+# If DG not merged, merged already defined
+if not dg_merged:
+    merged = dk.copy()
 
-# Gentle adjustment; keeps DK baseline intact
-blend_z = (1 - cut_weight) * dk["proj_z"] + cut_weight * dk["cut_z2"]
-dk["se_proj"] = dk["base_proj"] * (1 + 0.06 * blend_z.clip(-2, 2) / 2.0)
+# =========================
+# PROJECTION BASELINE
+# =========================
+st.subheader("Projection Baseline (leave defaults unless you want to tune)")
 
-# Clean numeric issues (prevents solver crash)
-dk = dk.replace([np.inf, -np.inf], np.nan)
-dk = dk.dropna(subset=["se_proj", salary_col, name_col]).copy()
-
-# -------------------------
-# Optional bumps + locks/excludes
-# -------------------------
-st.subheader("Optional Manual Controls (fast pivots)")
-all_names = dk[name_col].tolist()
-
-locks = st.multiselect("Lock golfers (optional)", options=all_names, default=[])
-excludes = st.multiselect("Exclude golfers (optional)", options=[n for n in all_names if n not in locks], default=[])
-
-bump_players = st.multiselect("Bump / Penalize golfers (optional)", options=[n for n in all_names if n not in excludes])
-bump_map = {}
-for p in bump_players:
-    bump_map[p] = st.slider(f"{p} bump %", -25, 25, 0, 1)
-
-dk["bump_pct"] = dk[name_col].map(lambda n: bump_map.get(n, 0))
-dk["final_base"] = dk["se_proj"] * (1 + dk["bump_pct"] / 100.0)
-
-# -------------------------
-# Balanced Constraints + Multi-lineup + Randomness
-# -------------------------
-st.subheader("Build Lineups (Balanced + Randomness + Overlap Control)")
-
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3 = st.columns(3)
 with c1:
-    num_lineups = st.slider("Lineups", 1, 3, 1, 1)
+    anchor_pts = st.slider("Salary anchor points (median salary golfer)", 10.0, 120.0, 55.0, 0.5)
 with c2:
-    rand_strength = st.slider("Randomness %", 0.0, 20.0, 6.0, 0.5)
+    slope_pts = st.slider("Salary slope (points per $1k)", 0.5, 10.0, 3.0, 0.1)
 with c3:
-    max_overlap = st.slider("Max overlap (for lineup 2/3)", 0, 6, 4, 1)
-with c4:
-    seed = st.number_input("Random seed", min_value=0, max_value=999999, value=2026, step=1)
+    w_dk = st.slider("Weight on DK AvgPointsPerGame", 0.0, 1.0, 0.70, 0.05)
 
-st.markdown("### Balanced Constraints")
-d1, d2, d3, d4 = st.columns(4)
-with d1:
-    min_total_salary = st.number_input("Min total salary", min_value=0, max_value=SALARY_CAP, value=49300, step=100)
-with d2:
-    max_under_7k = st.slider("Max golfers under $7,000", 0, 3, 1, 1)
-with d3:
-    max_over_10500 = st.slider("Max golfers over $10,500", 0, 3, 1, 1)
-with d4:
-    min_avg_salary = st.slider("Min avg salary per golfer", 6500, 9500, 8000, 100)
+# Create salary-based baseline projection
+median_salary = float(merged["salary"].median()) if len(merged) else 8000.0
+merged["base_salary_proj"] = anchor_pts + slope_pts * ((merged["salary"] - median_salary) / 1000.0)
 
-run = st.button("Generate Lineups", type="primary")
+# Blend with DK avg if present
+# If dk_avg is missing, fallback to salary proj
+merged["base_proj"] = merged["base_salary_proj"]
+has_dk_avg = merged["dk_avg"].notna()
+merged.loc[has_dk_avg, "base_proj"] = (
+    (1.0 - w_dk) * merged.loc[has_dk_avg, "base_salary_proj"] + w_dk * merged.loc[has_dk_avg, "dk_avg"]
+)
 
-# -------------------------
-# Optimizer
-# -------------------------
-if run:
-    pool = dk.copy()
-    if excludes:
-        pool = pool[~pool[name_col].isin(excludes)].copy()
+# =========================
+# CUT SAFETY + SE PROJ
+# =========================
+st.subheader("Single Entry Blend")
 
-    # Ensure locks exist in pool
-    missing_locks = [lk for lk in locks if lk not in set(pool[name_col])]
-    if missing_locks:
-        st.error(f"Locked golfers not found after exclusions: {missing_locks}")
-        st.stop()
+cut_available = any(c.startswith("dg_") for c in merged.columns)
 
-    # Final cleanup for solver
-    pool = pool.replace([np.inf, -np.inf], np.nan)
-    pool = pool.dropna(subset=["final_base", salary_col, name_col]).copy()
-    pool = pool[pool[salary_col] > 0].reset_index(drop=True)
+cs_weight = st.slider("CutSafety weight (SE cash bias)", 0.0, 0.60, 0.25, 0.01)
 
-    if len(pool) < ROSTER_SIZE:
-        st.error("Not enough golfers in pool after cleaning/exclusions.")
-        st.stop()
-
-    rng = np.random.default_rng(int(seed))
-    previous_sets: list[set[int]] = []
-    out_frames: list[pd.DataFrame] = []
-
-    for k in range(int(num_lineups)):
-        # add per-lineup randomness
-        noise = rng.normal(0.0, 1.0, size=len(pool))
-        pool[f"obj_{k}"] = pool["final_base"] * (1.0 + (rand_strength / 100.0) * noise)
-
-        prob = LpProblem(f"DK_Golf_Lineup_{k+1}", LpMaximize)
-        x = [LpVariable(f"x_{k}_{i}", 0, 1, LpBinary) for i in range(len(pool))]
-
-        # Objective
-        prob += lpSum(pool.loc[i, f"obj_{k}"] * x[i] for i in range(len(pool)))
-
-        # Roster size
-        prob += lpSum(x[i] for i in range(len(pool))) == ROSTER_SIZE
-
-        # Salary cap + min salary
-        prob += lpSum(pool.loc[i, salary_col] * x[i] for i in range(len(pool))) <= SALARY_CAP
-        prob += lpSum(pool.loc[i, salary_col] * x[i] for i in range(len(pool))) >= float(min_total_salary)
-
-        # Balanced constraints
-        prob += lpSum(x[i] for i in range(len(pool)) if pool.loc[i, salary_col] < 7000) <= int(max_under_7k)
-        prob += lpSum(x[i] for i in range(len(pool)) if pool.loc[i, salary_col] > 10500) <= int(max_over_10500)
-        prob += lpSum(pool.loc[i, salary_col] * x[i] for i in range(len(pool))) >= float(min_avg_salary) * ROSTER_SIZE
-
-        # Locks
-        for lk in locks:
-            idxs = pool.index[pool[name_col] == lk].tolist()
-            if idxs:
-                prob += x[idxs[0]] == 1
-
-        # Overlap control (for lineup 2/3)
-        if k > 0:
-            for prev in previous_sets:
-                prob += lpSum(x[i] for i in prev) <= int(max_overlap)
-
-        solver = PULP_CBC_CMD(msg=False)
-        prob.solve(solver)
-
-        if str(prob.status) != "1":
-            st.error(
-                "No feasible lineup found. Try relaxing constraints:\n"
-                "- lower Min total salary\n"
-                "- lower Min avg salary\n"
-                "- allow more under $7k\n"
-                "- reduce locks\n"
-            )
+# Compute CutSafety from DataGolf if available; else neutral
+if cut_available:
+    # Prefer total SG; else T2G; else App; else neutral
+    cs_src = None
+    for col in ["dg_sg_total", "dg_sg_t2g", "dg_sg_app", "dg_sg_ott", "dg_sg_putt", "dg_sg_arg"]:
+        if col in merged.columns and merged[col].notna().sum() > 5:
+            cs_src = col
             break
 
-        chosen_idx = {i for i in range(len(pool)) if x[i].value() == 1}
-        previous_sets.append(chosen_idx)
+    if cs_src:
+        merged["cut_safety"] = percentile_rank(merged[cs_src])
+    else:
+        merged["cut_safety"] = 50.0
+else:
+    merged["cut_safety"] = 50.0
 
-        lineup = pool.loc[list(chosen_idx)].copy()
-        lineup["lineup"] = k + 1
-        lineup = lineup.sort_values("final_base", ascending=False)
+# SE projection = base_proj + (CutSafety z-ish bump)
+# Bump is small and centered so it doesn't dominate
+merged["cut_safety_adj"] = (merged["cut_safety"] - 50.0) / 50.0  # -1..+1
+merged["se_proj"] = merged["base_proj"] * (1.0 + cs_weight * merged["cut_safety_adj"])
 
-        total_salary = int(lineup[salary_col].sum())
-        total_proj = float(lineup["final_base"].sum())
+# Value metric
+merged["value_1k"] = merged["se_proj"] / (merged["salary"] / 1000.0)
 
-        st.markdown(f"## Lineup {k+1}")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Salary Used", f"${total_salary:,}")
-        m2.metric("Projected (Final)", f"{total_proj:.2f}")
-        m3.metric("Salary Left", f"${SALARY_CAP - total_salary:,}")
+# Clean numerics to prevent NaN in PuLP objective
+merged = safe_numeric(
+    merged,
+    ["base_salary_proj", "base_proj", "cut_safety", "cut_safety_adj", "se_proj", "value_1k", "dk_avg"],
+    fill=0.0,
+)
 
-        show_cols = [name_col, salary_col, "final_base", "bump_pct", "base_proj", "se_proj"]
-        if cut_available:
-            show_cols.append("cut_safety")
-        st.dataframe(lineup[show_cols], use_container_width=True)
+# Show top table
+st.markdown("### Top Players (by SE projection)")
+st.dataframe(
+    merged.sort_values("se_proj", ascending=False)[
+        ["name", "salary", "base_proj", "se_proj", "value_1k", "cut_safety"]
+    ].head(25),
+    use_container_width=True,
+)
 
-        out_frames.append(lineup[["lineup"] + show_cols])
 
-    if out_frames:
-        out = pd.concat(out_frames, ignore_index=True)
+# =========================
+# LINEUP BUILDER SETTINGS
+# =========================
+st.subheader("Build Lineups (Balanced + Randomness + Overlap Control)")
+
+ROSTER_SIZE = 6
+SALARY_CAP = 50000
+
+b1, b2, b3, b4 = st.columns(4)
+with b1:
+    n_lineups = st.slider("Lineups", 1, 3, 2)
+with b2:
+    base_rand = st.slider("Randomness % (Lineup #1)", 0.0, 25.0, 6.0, 0.5)
+with b3:
+    spike_rand = st.slider("Randomness % (Lineup #2)", 0.0, 25.0, 12.0, 0.5)
+with b4:
+    seed = st.number_input("Random seed", min_value=0, max_value=999999, value=2026, step=1)
+
+# Balanced constraints
+cA, cB, cC, cD = st.columns(4)
+with cA:
+    min_total_salary = st.slider("Min total salary", 45000, 50000, 49300, 100)
+with cB:
+    min_avg_salary = st.slider("Min avg salary per golfer", 6500, 9500, 8000, 100)
+with cC:
+    max_under_7000_safe = st.slider("Lineup #1: max golfers under $7,000", 0, 3, 0, 1)
+with cD:
+    max_over_10500 = st.slider("Max golfers over $10,500", 0, 3, 1, 1)
+
+# C-mode spike construction (Lineup #2)
+st.markdown("### Spike Mode (Lineup #2 only)")
+s1, s2, s3 = st.columns(3)
+with s1:
+    force_spike = st.toggle("Lineup #2: Force 2 studs + 1 punt", value=True)
+with s2:
+    stud_threshold = st.number_input("Stud threshold ($)", min_value=9000, max_value=12000, value=10000, step=100)
+with s3:
+    punt_threshold = st.number_input("Punt threshold ($)", min_value=5000, max_value=8000, value=7000, step=100)
+
+# Guardrails
+st.markdown("### Guardrails")
+g1, g2, g3 = st.columns(3)
+with g1:
+    enable_guardrails = st.toggle("Enable CutSafety guardrails", value=True)
+with g2:
+    cs_min_floor = st.slider("CutSafety floor (Lineup #1 hard floor)", 0.0, 90.0, 60.0, 1.0)
+with g3:
+    cs_min_avg = st.slider("Min average CutSafety (both lineups)", 0.0, 90.0, 65.0, 1.0)
+
+# Overlap control
+max_overlap = st.slider("Max overlap between lineups (when building 2–3)", 0, 6, 4, 1)
+
+# Manual controls
+st.markdown("### Optional Manual Controls (fast pivots)")
+m1, m2, m3 = st.columns(3)
+with m1:
+    lock_names = st.multiselect("Lock golfers", options=sorted(merged["name"].unique().tolist()))
+with m2:
+    exclude_names = st.multiselect("Exclude golfers", options=sorted(merged["name"].unique().tolist()))
+with m3:
+    bump_names = st.multiselect("Bump golfers (small +%)", options=sorted(merged["name"].unique().tolist()))
+
+bump_pct = st.slider("Bump % (applied to 'Bump golfers')", 0.0, 20.0, 5.0, 0.5)
+
+# Build button
+build = st.button("Generate Lineups", type="primary")
+
+
+# =========================
+# OPTIMIZER
+# =========================
+def build_lineup(
+    pool: pd.DataFrame,
+    objective_col: str,
+    min_total_salary_i: int,
+    max_under_7000: int,
+    force_spike_mode: bool,
+    stud_threshold_i: int,
+    punt_threshold_i: int,
+    lineup_index: int,
+    prev_lineups: List[set],
+) -> BuildResult:
+    """
+    Build one lineup using PuLP.
+    """
+    pool = pool.copy().reset_index(drop=True)
+
+    # Variables
+    x = [LpVariable(f"x_{lineup_index}_{i}", cat="Binary") for i in range(len(pool))]
+
+    prob = LpProblem(f"DK_Golf_LU_{lineup_index+1}", LpMaximize)
+
+    # Objective
+    obj_vals = pool[objective_col].astype(float).values
+    # Final safety: ensure objective values are finite
+    obj_vals = np.nan_to_num(obj_vals, nan=0.0, posinf=0.0, neginf=0.0)
+    prob += lpSum(obj_vals[i] * x[i] for i in range(len(pool)))
+
+    # Roster size
+    prob += lpSum(x) == ROSTER_SIZE
+
+    # Salary constraints
+    salaries = pool["salary"].astype(int).values
+    prob += lpSum(int(salaries[i]) * x[i] for i in range(len(pool))) <= SALARY_CAP
+    prob += lpSum(int(salaries[i]) * x[i] for i in range(len(pool))) >= int(min_total_salary_i)
+
+    # Min avg salary per golfer
+    prob += lpSum(int(salaries[i]) * x[i] for i in range(len(pool))) >= int(min_avg_salary) * ROSTER_SIZE
+
+    # Max over 10.5k
+    prob += lpSum(x[i] for i in range(len(pool)) if int(salaries[i]) > 10500) <= int(max_over_10500)
+
+    # Under 7k (safe lineup rule)
+    prob += lpSum(x[i] for i in range(len(pool)) if int(salaries[i]) < int(punt_threshold_i)) <= int(max_under_7000)
+
+    # Spike mode construction for lineup #2 (index 1)
+    if lineup_index == 1 and force_spike_mode:
+        # exactly 1 punt
+        prob += lpSum(x[i] for i in range(len(pool)) if int(salaries[i]) < int(punt_threshold_i)) == 1
+        # exactly 2 studs
+        prob += lpSum(x[i] for i in range(len(pool)) if int(salaries[i]) >= int(stud_threshold_i)) == 2
+
+    # Guardrails based on cut_safety
+    if enable_guardrails:
+        cs = pool["cut_safety"].astype(float).values
+        cs = np.nan_to_num(cs, nan=50.0, posinf=50.0, neginf=50.0)
+
+        # Hard floor for lineup #1 only (and for lineup #2 only if spike not forced)
+        if not (lineup_index == 1 and force_spike_mode):
+            prob += lpSum(x[i] for i in range(len(pool)) if float(cs[i]) < float(cs_min_floor)) == 0
+
+        # Min average cut safety always
+        prob += lpSum(float(cs[i]) * x[i] for i in range(len(pool))) >= float(cs_min_avg) * ROSTER_SIZE
+
+    # Locks / excludes by name
+    name_list = pool["name"].astype(str).tolist()
+    name_to_idx = {}
+    for i, nm in enumerate(name_list):
+        name_to_idx.setdefault(nm, []).append(i)
+
+    for nm in lock_names:
+        if nm in name_to_idx:
+            prob += lpSum(x[i] for i in name_to_idx[nm]) == 1
+
+    for nm in exclude_names:
+        if nm in name_to_idx:
+            prob += lpSum(x[i] for i in name_to_idx[nm]) == 0
+
+    # Overlap control with previous lineups
+    # Each new lineup cannot share more than max_overlap with any previous lineup
+    if prev_lineups:
+        for j, prev in enumerate(prev_lineups):
+            prev_idx = [i for i, nm in enumerate(name_list) if nm in prev]
+            if prev_idx:
+                prob += lpSum(x[i] for i in prev_idx) <= int(max_overlap)
+
+    # Solve
+    solver = PULP_CBC_CMD(msg=False)
+    prob.solve(solver)
+
+    status = LpStatus.get(prob.status, str(prob.status))
+    if status != "Optimal":
+        return BuildResult(
+            lineup=pd.DataFrame(),
+            total_salary=0,
+            total_proj=0.0,
+            status=status,
+        )
+
+    chosen = [i for i in range(len(pool)) if x[i].value() == 1]
+    lu = pool.loc[chosen, ["name", "salary", "base_proj", "se_proj", "cut_safety"]].copy()
+
+    # Total salary / proj
+    tot_sal = int(lu["salary"].sum())
+    tot_proj = float(lu["se_proj"].sum())
+
+    # Sort display: high salary first
+    lu = lu.sort_values("salary", ascending=False).reset_index(drop=True)
+
+    return BuildResult(lineup=lu, total_salary=tot_sal, total_proj=tot_proj, status=status)
+
+
+# =========================
+# RUN BUILD
+# =========================
+if build:
+    pool = merged.copy()
+
+    # Apply bumps before randomness (small deterministic tweak)
+    pool["bump_pct"] = 0.0
+    if bump_names:
+        pool.loc[pool["name"].isin(bump_names), "bump_pct"] = float(bump_pct)
+
+    pool["final_base"] = pool["se_proj"] * (1.0 + pool["bump_pct"] / 100.0)
+
+    # Ensure numeric cleanliness to prevent PuLP NaN/inf errors
+    pool = safe_numeric(pool, ["final_base", "se_proj", "base_proj", "cut_safety"], fill=0.0)
+
+    rng = np.random.default_rng(int(seed))
+
+    results: List[BuildResult] = []
+    prev_lineups: List[set] = []
+
+    for k in range(int(n_lineups)):
+        this_rand = float(base_rand) if k == 0 else float(spike_rand)
+
+        noise = rng.normal(0.0, 1.0, size=len(pool))
+        obj = pool["final_base"].astype(float).values * (1.0 + (this_rand / 100.0) * noise)
+
+        # Keep objective finite
+        obj = np.nan_to_num(obj, nan=0.0, posinf=0.0, neginf=0.0)
+
+        obj_col = f"obj_{k}"
+        pool[obj_col] = obj
+
+        # For lineup #1, enforce "max_under_7000_safe"
+        # For lineup #2 spike mode, we'll allow under 7k (and possibly force it)
+        max_under = int(max_under_7000_safe) if k == 0 else 6
+
+        res = build_lineup(
+            pool=pool,
+            objective_col=obj_col,
+            min_total_salary_i=int(min_total_salary),
+            max_under_7000=max_under,
+            force_spike_mode=bool(force_spike),
+            stud_threshold_i=int(stud_threshold),
+            punt_threshold_i=int(punt_threshold),
+            lineup_index=k,
+            prev_lineups=prev_lineups,
+        )
+
+        results.append(res)
+
+        if not res.lineup.empty:
+            prev_lineups.append(set(res.lineup["name"].tolist()))
+
+    # Display
+    st.markdown("---")
+    st.subheader("Results")
+
+    any_ok = False
+    out_csv_rows = []
+
+    for i, res in enumerate(results):
+        st.markdown(f"### Lineup {i+1}")
+
+        if res.status != "Optimal":
+            st.error(f"Optimizer status: **{res.status}**. Try loosening constraints (min salary / overlap / locks).")
+            continue
+
+        any_ok = True
+        a, b, c = st.columns(3)
+        a.metric("Salary Used", f"${res.total_salary:,}")
+        b.metric("Projected (SE)", f"{res.total_proj:.2f}")
+        c.metric("Salary Left", f"${SALARY_CAP - res.total_salary:,}")
+
+        st.dataframe(res.lineup, use_container_width=True)
+
+        # Prepare export rows
+        for _, row in res.lineup.iterrows():
+            out_csv_rows.append(
+                {
+                    "lineup": i + 1,
+                    "name": row["name"],
+                    "salary": int(row["salary"]),
+                    "base_proj": float(row["base_proj"]),
+                    "se_proj": float(row["se_proj"]),
+                    "cut_safety": float(row["cut_safety"]),
+                }
+            )
+
+    if any_ok and out_csv_rows:
+        out_df = pd.DataFrame(out_csv_rows)
+        csv_bytes = out_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download Lineups CSV",
-            data=out.to_csv(index=False).encode("utf-8"),
+            data=csv_bytes,
             file_name="dk_golf_lineups.csv",
             mime="text/csv",
         )
 
-# -------------------------
-# Player table
-# -------------------------
-st.subheader("Top Players (by SE projection)")
-display_cols = [name_col, salary_col, "base_proj", "se_proj", "final_base"]
-if cut_available:
-    display_cols.append("cut_safety")
-
-st.dataframe(
-    dk.sort_values("final_base", ascending=False)[display_cols].head(50),
-    use_container_width=True
-)
+    st.markdown("---")
+    st.caption("Tip: If you keep seeing 'not optimal', reduce overlap, lower min salary, or remove locks.")
